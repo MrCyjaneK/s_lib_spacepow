@@ -15,6 +15,32 @@ func Solve(challenge string) (string, error) {
 	return SolveContext(ctx, challenge)
 }
 
+func SolveProgress(ctx context.Context, challenge string, every uint64, tick func(tried uint64)) (string, error) {
+	ch, err := parseChallenge(challenge)
+	if err != nil {
+		return "", err
+	}
+	if every == 0 {
+		every = 1 << 16
+	}
+	var tried uint64
+	for n := uint64(0); ; n++ {
+		if tried%every == 0 {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			if tick != nil && tried > 0 {
+				tick(tried)
+			}
+		}
+		if meetsDifficulty(powDigest(ch.Payload, n), ch.Difficulty) {
+			ch.Nonce = n
+			return marshalChallenge(ch)
+		}
+		tried++
+	}
+}
+
 func SolveContext(ctx context.Context, challenge string) (string, error) {
 	ch, err := parseChallenge(challenge)
 	if err != nil {

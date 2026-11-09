@@ -16,20 +16,36 @@ import (
 var ttl = 15 * time.Minute
 
 var (
-	errInvalidDifficulty = errors.New("spacepow: invalid difficulty")
-	errInvalidChallenge  = errors.New("spacepow: invalid challenge")
-	errInvalidSignature  = errors.New("spacepow: invalid signature")
-	errExpired           = errors.New("spacepow: challenge expired")
-	errBindingMismatch   = errors.New("spacepow: binding mismatch")
-	errInvalidSolution   = errors.New("spacepow: solution does not meet difficulty")
-	errAlreadyUsed       = errors.New("spacepow: challenge already used")
+	ErrInvalidDifficulty = errors.New("spacepow: invalid difficulty")
+	ErrInvalidChallenge  = errors.New("spacepow: invalid challenge")
+	ErrInvalidSignature  = errors.New("spacepow: invalid signature")
+	ErrExpired           = errors.New("spacepow: challenge expired")
+	ErrBindingMismatch   = errors.New("spacepow: binding mismatch")
+	ErrInvalidSolution   = errors.New("spacepow: solution does not meet difficulty")
+	ErrAlreadyUsed       = errors.New("spacepow: challenge already used")
 
 	secretOnce sync.Once
 	secretKey  []byte
 
 	usedMu sync.Mutex
-	used   = map[string]time.Time{}
+	// used maps a challenge id to the instant it stops being replayable (its expiresAt).
+	used = map[string]time.Time{}
+
+	timeNow = time.Now
 )
+
+func clock() time.Time { return timeNow() }
+
+// TestingSetNow replaces the clock until the returned function restores it.
+func TestingSetNow(fn func() time.Time) func() {
+	prev := timeNow
+	if fn == nil {
+		timeNow = time.Now
+	} else {
+		timeNow = fn
+	}
+	return func() { timeNow = prev }
+}
 
 type wireChallenge struct {
 	ID         string    `json:"id"`
@@ -88,7 +104,7 @@ func verifySig(ch *wireChallenge) error {
 		return err
 	}
 	if !hmac.Equal([]byte(sig), []byte(ch.Sig)) {
-		return errInvalidSignature
+		return ErrInvalidSignature
 	}
 	return nil
 }
@@ -104,37 +120,41 @@ func marshalChallenge(ch *wireChallenge) (string, error) {
 func parseChallenge(s string) (*wireChallenge, error) {
 	ch := &wireChallenge{}
 	if err := json.Unmarshal([]byte(s), ch); err != nil {
-		return nil, errInvalidChallenge
+		return nil, ErrInvalidChallenge
 	}
 	if ch.ID == "" || len(ch.Payload) == 0 || ch.Difficulty <= 0 || ch.ExpiresAt.IsZero() {
-		return nil, errInvalidChallenge
+		return nil, ErrInvalidChallenge
 	}
 	return ch, nil
 }
 
 func cleanupUsed() {
-	cutoff := time.Now().Add(-ttl)
-	for id, t := range used {
-		if t.Before(cutoff) {
+	now := clock()
+	for id, exp := range used {
+		if now.After(exp) {
 			delete(used, id)
 		}
 	}
 }
 
-func markUsed(id string) error {
+func markUsed(id string, expiresAt time.Time) error {
 	usedMu.Lock()
 	defer usedMu.Unlock()
 	cleanupUsed()
 	if _, ok := used[id]; ok {
-		return errAlreadyUsed
+		return ErrAlreadyUsed
 	}
-	used[id] = time.Now()
+	used[id] = expiresAt
 	return nil
 }
 
 func Generate(binding string, difficulty int) (string, error) {
-	if difficulty < 1 || difficulty > 64 {
-		return "", errInvalidDifficulty
+	return GenerateWithTTL(binding, difficulty, ttl)
+}
+
+func GenerateWithTTL(binding string, difficulty int, lifetime time.Duration) (string, error) {
+	if difficulty < 1 || difficulty > 64 || lifetime <= 0 {
+		return "", ErrInvalidDifficulty
 	}
 	initSecret()
 
@@ -152,7 +172,7 @@ func Generate(binding string, difficulty int) (string, error) {
 		Binding:    binding,
 		Payload:    payload,
 		Difficulty: difficulty,
-		ExpiresAt:  time.Now().Add(ttl),
+		ExpiresAt:  clock().Add(lifetime),
 	}
 	sig, err := sign(ch)
 	if err != nil {
@@ -167,23 +187,40 @@ func Verify(binding string, solved string) error {
 
 	ch := &wireChallenge{}
 	if err := json.Unmarshal([]byte(solved), ch); err != nil {
-		return errInvalidChallenge
+		return ErrInvalidChallenge
 	}
 	if ch.ID == "" || len(ch.Payload) == 0 || ch.Difficulty <= 0 || ch.ExpiresAt.IsZero() || ch.Sig == "" {
-		return errInvalidChallenge
+		return ErrInvalidChallenge
 	}
 	if err := verifySig(ch); err != nil {
 		return err
 	}
-	if time.Now().After(ch.ExpiresAt) {
-		return errExpired
+	if clock().After(ch.ExpiresAt) {
+		return ErrExpired
 	}
 	if ch.Binding != binding {
-		return errBindingMismatch
+		return ErrBindingMismatch
 	}
 	d := powDigest(ch.Payload, ch.Nonce)
 	if !meetsDifficulty(d, ch.Difficulty) {
-		return errInvalidSolution
+		return ErrInvalidSolution
 	}
-	return markUsed(ch.ID)
+	return markUsed(ch.ID, ch.ExpiresAt)
+}
+
+// Inspect checks the signature and returns the ticket fields. It does not
+// check expiry, the solution, or whether the id was already spent.
+func Inspect(solved string) (id, binding string, difficulty int, expiresAt time.Time, err error) {
+	initSecret()
+	ch := &wireChallenge{}
+	if err = json.Unmarshal([]byte(solved), ch); err != nil {
+		return "", "", 0, time.Time{}, ErrInvalidChallenge
+	}
+	if ch.ID == "" || len(ch.Payload) == 0 || ch.Difficulty <= 0 || ch.ExpiresAt.IsZero() || ch.Sig == "" {
+		return "", "", 0, time.Time{}, ErrInvalidChallenge
+	}
+	if err = verifySig(ch); err != nil {
+		return "", "", 0, time.Time{}, err
+	}
+	return ch.ID, ch.Binding, ch.Difficulty, ch.ExpiresAt, nil
 }
